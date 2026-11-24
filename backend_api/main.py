@@ -1,31 +1,34 @@
-from dotenv import load_dotenv
-load_dotenv()
 from contextlib import asynccontextmanager
 import hashlib
 import math
 import os
 import re
-import uuid
 from typing import Optional
+import uuid
 
+import cloudinary
+import cloudinary.uploader
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 import mysql.connector
 from rapidocr_onnxruntime import RapidOCR
 
-# =============================================================================
-# CONFIGURACIÓN GENERAL DEL SERVIDOR Y GEOCERCA UNIVERSITARIA
-# =============================================================================
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+load_dotenv()
 
-# Coordenadas centrales del campus y radio máximo permitido (en metros)
+# =============================================================================
+# CONFIGURACIÓN DE CLOUDINARY, BASE DE DATOS Y GEOCERCA UNIVERSITARIA
+# =============================================================================
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
+
 CAMPUS_LAT = 18.06750
 CAMPUS_LON = -93.16850
 RADIO_CAMPUS_METROS = 450
-
-# Cambia a True cuando configures las coordenadas reales de tu universidad
 VALIDAR_PERIMETRO_SERVIDOR = False
 
 DB_CONFIG = {
@@ -56,8 +59,10 @@ def asegurar_esquema_db():
             ) NOT NULL DEFAULT 'AULA'
             """,
             "ALTER TABLE reportes_fallas ADD COLUMN fecha_resolucion TIMESTAMP NULL AFTER fecha_creacion",
+            "ALTER TABLE reportes_fallas MODIFY COLUMN url_foto VARCHAR(500) NULL",
             "ALTER TABLE objetos_campus ADD COLUMN texto_ocr TEXT NULL AFTER descripcion",
             "ALTER TABLE objetos_campus ADD COLUMN fecha_entrega TIMESTAMP NULL AFTER fecha_creacion",
+            "ALTER TABLE objetos_campus MODIFY COLUMN url_foto VARCHAR(500) NULL",
         ]
         for sql in sentencias:
             try:
@@ -86,11 +91,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-
 
 # =============================================================================
-# FUNCIONES AUXILIARES (GPS, ESPACIOS, IMÁGENES Y OCR)
+# FUNCIONES AUXILIARES (GPS, ESPACIOS, CLOUDINARY Y OCR)
 # =============================================================================
 def calcular_distancia_metros(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000
@@ -144,20 +147,30 @@ def obtener_o_crear_espacio(cursor, nivel: str, tipo_espacio: str, espacio: str)
     return cursor.lastrowid
 
 
-async def guardar_imagen(foto: UploadFile) -> str:
-    extension = os.path.splitext(foto.filename or "")[1] or ".jpg"
-    nombre_archivo = f"{uuid.uuid4().hex}{extension}"
-    ruta_destino = os.path.join(UPLOAD_DIR, nombre_archivo)
+async def guardar_imagen(foto: UploadFile, carpeta: str = "unifix_found") -> tuple[str, bytes]:
+    """Sube la imagen a Cloudinary y retorna (url_segura_https, bytes_imagen)."""
     contenido = await foto.read()
-    with open(ruta_destino, "wb") as f:
-        f.write(contenido)
-    return f"/uploads/{nombre_archivo}"
-
-
-def analizar_texto_imagen(ruta_imagen: str) -> dict:
-    """Extrae texto legible y detecta posibles matrículas universitarias."""
+    if not contenido:
+        raise HTTPException(status_code=400, detail="El archivo de imagen está vacío.")
     try:
-        resultado, _ = motor_ocr(ruta_imagen)
+        resultado = cloudinary.uploader.upload(
+            contenido,
+            folder=carpeta,
+            public_id=uuid.uuid4().hex,
+            resource_type="image",
+        )
+        return resultado["secure_url"], contenido
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al subir la fotografía a Cloudinary: {str(e)}",
+        )
+
+
+def analizar_texto_imagen(imagen_bytes: bytes) -> dict:
+    """Extrae texto legible desde bytes y detecta posibles matrículas universitarias."""
+    try:
+        resultado, _ = motor_ocr(imagen_bytes)
         if not resultado:
             return {"texto_completo": "", "matricula": None}
 
@@ -275,7 +288,7 @@ async def crear_reporte_falla(
             detail="Escribe el nombre o número de aula/laboratorio.",
         )
 
-    url_foto = await guardar_imagen(foto)
+    url_foto, _ = await guardar_imagen(foto, carpeta="unifix_found/fallas")
 
     conn = get_db()
     cursor = conn.cursor()
@@ -302,6 +315,7 @@ async def crear_reporte_falla(
         conn.commit()
         return {
             "id_falla": cursor.lastrowid,
+            "url_foto": url_foto,
             "mensaje": f"Falla registrada en {espacio.strip()} ({nivel}).",
         }
     finally:
@@ -409,10 +423,9 @@ async def crear_reporte_objeto(
     texto_ocr = None
     matricula_detectada = None
 
-    if foto:
-        url_foto = await guardar_imagen(foto)
-        ruta_fisica = os.path.join(UPLOAD_DIR, os.path.basename(url_foto))
-        datos_ocr = analizar_texto_imagen(ruta_fisica)
+    if foto and foto.filename:
+        url_foto, bytes_foto = await guardar_imagen(foto, carpeta="unifix_found/objetos")
+        datos_ocr = analizar_texto_imagen(bytes_foto)
         texto_ocr = datos_ocr["texto_completo"] or None
         matricula_detectada = datos_ocr["matricula"]
 
@@ -477,6 +490,7 @@ async def crear_reporte_objeto(
 
         return {
             "id_objeto": nuevo_id,
+            "url_foto": url_foto,
             "matricula_ocr": matricula_detectada,
             "mensaje": f"Reporte registrado en {espacio.strip()}.{aviso_extra}",
         }
